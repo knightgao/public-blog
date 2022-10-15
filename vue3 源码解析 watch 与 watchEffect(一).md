@@ -1,8 +1,8 @@
-## vue3 源码解析 watch 与 watchEffect
+## vue3 源码解析 watch
 
 ### 背景
 
-很多同学之前写vue2，应该都用过watch，但是watchEffect用的相对较少，这次和秋老师一起来探索下，vue3中 watch watchEffect的源码实现，来加深下理解吧。
+很多同学之前写vue2，应该都用过watch，但是watchEffect用的相对较少，这次和秋老师一起来探索下，vue3中 watch 的源码实现，来加深下理解吧。
 
 ### watch 用法简介
 
@@ -489,6 +489,7 @@ export function createPathGetter(ctx: any, path: string) {
   }
 }
 
+// traverse 会递归去访问对象的深层子属性，对性能敏感的场景此处是个优化点
 export function traverse(value: unknown, seen?: Set<unknown>) {
   if (!isObject(value) || (value as any)[ReactiveFlags.SKIP]) {
     return value
@@ -609,11 +610,14 @@ function doWatch(
         }
       })
   } else if (isFunction(source)) {
+      // 如果是一个函数，判断cb是否存在，存在就callWithErrorHandling
+      
     if (cb) {
       // getter with cb
       getter = () =>
         callWithErrorHandling(source, instance, ErrorCodes.WATCH_GETTER)
     } else {
+        // 如果不存在，则单纯的响应式
       // no cb -> simple effect
       getter = () => {
         if (instance && instance.isUnmounted) {
@@ -654,14 +658,7 @@ function doWatch(
     const baseGetter = getter
     getter = () => traverse(baseGetter())
   }
-
-  let cleanup: () => void
-  let onCleanup: OnCleanup = (fn: () => void) => {
-    cleanup = effect.onStop = () => {
-      callWithErrorHandling(fn, instance, ErrorCodes.WATCH_CLEANUP)
-    }
-  }
-
+    
   // in SSR there is no need to setup an actual effect, and it should be noop
   // unless it's eager
   if (__SSR__ && isInSSRComponentSetup) {
@@ -679,14 +676,30 @@ function doWatch(
     return NOOP
   }
 
+  // 这个回调函数接受三个参数：新值、旧值，以及一个用于注册副作用清理的回调函数。该回调函数会在副作用下一次重新执行前调用，可以用来清除无效的副作用，例如等待中的异步请求。
+  // 创建job
+   let cleanup: () => void
+   
+   // 注册无效回调函数
+  let onCleanup: OnCleanup = (fn: () => void) => {
+    cleanup = effect.onStop = () => {
+      callWithErrorHandling(fn, instance, ErrorCodes.WATCH_CLEANUP)
+    }
+  }
+    // 旧值
   let oldValue = isMultiSource ? [] : INITIAL_WATCHER_VALUE
+  // 异步任务
   const job: SchedulerJob = () => {
+    // 没激活就直接返回
     if (!effect.active) {
       return
     }
+    
     if (cb) {
       // watch(source, cb)
+     // 获取新的值
       const newValue = effect.run()
+      // 满足执行回调函数的条件
       if (
         deep ||
         forceTrigger ||
@@ -700,15 +713,19 @@ function doWatch(
           isCompatEnabled(DeprecationTypes.WATCH_ARRAY, instance))
       ) {
         // cleanup before running cb again
+        // 再次执行前 执行清理
         if (cleanup) {
           cleanup()
         }
+        // 执行回调函数
         callWithAsyncErrorHandling(cb, instance, ErrorCodes.WATCH_CALLBACK, [
           newValue,
           // pass undefined as the old value when it's changed for the first time
+          // 第一次更改时，传递的旧值为 undefined
           oldValue === INITIAL_WATCHER_VALUE ? undefined : oldValue,
           onCleanup
         ])
+        更新旧值
         oldValue = newValue
       }
     } else {
@@ -719,20 +736,42 @@ function doWatch(
 
   // important: mark the job as a watcher callback so that scheduler knows
   // it is allowed to self-trigger (#1727)
+  
+  // 允许触发自身
   job.allowRecurse = !!cb
+    
+   // 如果存在cb，会先执行effect.run 函数，实际就是前面创建的getter函数，然后进行判断，如果是deep或者是forceTrigger强制更新
+ 
 
+    // 创建 scheduler 的作用，是根据某种调度的方法去执行某种函数。
   let scheduler: EffectScheduler
   if (flush === 'sync') {
+    // 同步 在某些特殊情况下 (例如要使缓存失效)，可能有必要在响应式依赖发生改变时立即触发侦听器
     scheduler = job as any // the scheduler function gets called directly
   } else if (flush === 'post') {
+    // 进入异步队列，组件更新后执行
     scheduler = () => queuePostRenderEffect(job, instance && instance.suspense)
   } else {
     // default: 'pre'
+    // 默认选项，在组件更新前执行
     job.pre = true
-    if (instance) job.id = instance.uid
-    scheduler = () => queueJob(job)
+    if (instance){
+      job.id = instance.uid
+    } 
+    scheduler = () =>  queueJob(job)
   }
+  
+   // flush 属性有3种情况
+    // 当 flush 为 sync ，表示它是个同步 watcher,即数据变化时同步执行回调函数
+    // 当 flush 为 post ，表示它是通过 queuePostRenderEffect，当组件更新之后执行
+    // 当 flush 为 pre ，当组件更新之前执行
 
+    
+    
+    // ------
+    
+    // 创建effect
+    
   const effect = new ReactiveEffect(getter, scheduler)
 
   if (__DEV__) {
@@ -741,10 +780,12 @@ function doWatch(
   }
 
   // initial run
+  // 初次执行
   if (cb) {
     if (immediate) {
       job()
     } else {
+      // 求旧值
       oldValue = effect.run()
     }
   } else if (flush === 'post') {
@@ -765,3 +806,42 @@ function doWatch(
 }
 ```
 
+这里贴出部分代码供参考
+
+```typescript
+// packages/runtime-core/src/scheduler.ts
+export function queueJob(job: SchedulerJob) {
+  // the dedupe search uses the startIndex argument of Array.includes()
+  // by default the search index includes the current job that is being run
+  // so it cannot recursively trigger itself again.
+  // if the job is a watch() callback, the search will start with a +1 index to
+  // allow it recursively trigger itself - it is the user's responsibility to
+  // ensure it doesn't end up in an infinite loop.
+  if (
+    !queue.length ||
+    !queue.includes(
+      job,
+      isFlushing && job.allowRecurse ? flushIndex + 1 : flushIndex
+    )
+  ) {
+    if (job.id == null) {
+      queue.push(job)
+    } else {
+      queue.splice(findInsertionIndex(job.id), 0, job)
+    }
+    queueFlush()
+  }
+}
+
+function queueFlush() {
+  if (!isFlushing && !isFlushPending) {
+    isFlushPending = true
+    // 内部是promise.then
+    currentFlushPromise = resolvedPromise.then(flushJobs)
+  }
+}
+```
+
+
+
+下次来探索下这个 queueJob 到底干了啥
